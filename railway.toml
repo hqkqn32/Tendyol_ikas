@@ -1,0 +1,12 @@
+[build]
+builder = "dockerfile"
+
+[deploy]
+startCommand = "python main.py"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
+
+[[services]]
+name = "weekly-cron"
+cronSchedule = "0 1 * * 1"
+startCommand = "curl -X POST http://localhost:8000/cron/weekly"
