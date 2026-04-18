@@ -102,6 +102,19 @@ def scrape_status(store_id: str):
     return {"jobs": rows}
 
 
+@app.get("/health/db")
+def health_db():
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) as count FROM \"ScrapeQueue\"")
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        return {"status": "ok", "queue_count": row["count"]}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
 @app.post("/cron/weekly")
 def cron_weekly():
     conn = get_connection()
