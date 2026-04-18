@@ -6,3 +6,4 @@ playwright
 openai
 requests
 psutil
+nest_asyncio
