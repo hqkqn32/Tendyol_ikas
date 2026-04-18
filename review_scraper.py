@@ -3,84 +3,16 @@ import concurrent.futures
 from playwright.async_api import async_playwright
 from db import get_connection
 
-REVIEW_API_PATTERN = "product-reviews/detailed"
-PARALLEL_TABS = 3
+BROWSERS = 2
+TABS = 3  # 2×3 = 6 paralel
+REVIEW_API_PATTERN = "review-read/product-reviews/detailed"
 
 
-async def fetch_reviews_for_product(page, content_id: str, seller_id: str = None) -> dict:
-    url = f"https://www.trendyol.com/ty/ty-p-{content_id}/yorumlar"
-    all_reviews = []
-    summary = {}
-    captured = []
-
-    async def handle_response(response):
-        if REVIEW_API_PATTERN in response.url and "page=0" in response.url:
-            try:
-                data = await response.json()
-                captured.append(data)
-            except:
-                pass
-
-    page.on("response", handle_response)
-
-    try:
-        await page.goto(url, wait_until="networkidle", timeout=30000)
-        await page.wait_for_timeout(1500)
-    except Exception as e:
-        print(f"❌ Sayfa yüklenemedi {content_id}: {e}")
-        page.remove_listener("response", handle_response)
-        return {"reviews": [], "summary": {}}
-
-    page.remove_listener("response", handle_response)
-
-    if not captured:
-        return {"reviews": [], "summary": {}}
-
-    first_page = captured[0]
-    result = first_page.get("result", {})
-    summary = result.get("summary", {})
-    total_pages = summary.get("totalPages", 0)
-    reviews = result.get("reviews", [])
-
-    if seller_id:
-        reviews = [r for r in reviews if str(r.get("seller", {}).get("id", "")) == str(seller_id)]
-
-    all_reviews.extend(reviews)
-    print(f"  📄 Sayfa 1/{total_pages} — {len(reviews)} yorum")
-
-    for pg in range(1, total_pages):
-        next_url = f"https://www.trendyol.com/ty/ty-p-{content_id}/yorumlar?sayfa={pg + 1}"
-        next_captured = []
-
-        async def handle_next(response):
-            if REVIEW_API_PATTERN in response.url:
-                try:
-                    data = await response.json()
-                    next_captured.append(data)
-                except:
-                    pass
-
-        page.on("response", handle_next)
-
-        try:
-            await page.goto(next_url, wait_until="networkidle", timeout=30000)
-            await page.wait_for_timeout(1500)
-        except:
-            page.remove_listener("response", handle_next)
-            break
-
-        page.remove_listener("response", handle_next)
-
-        if next_captured:
-            next_reviews = next_captured[0].get("result", {}).get("reviews", [])
-            if seller_id:
-                next_reviews = [r for r in next_reviews if str(r.get("seller", {}).get("id", "")) == str(seller_id)]
-            all_reviews.extend(next_reviews)
-            print(f"  📄 Sayfa {pg + 1}/{total_pages} — {len(next_reviews)} yorum")
-
-        await asyncio.sleep(1)
-
-    return {"reviews": all_reviews, "summary": summary}
+def normalize_seller_filter(reviews: list, seller_id: str) -> list:
+    return [
+        r for r in reviews
+        if str(r.get("seller", {}).get("id", "")) == str(seller_id)
+    ]
 
 
 def save_reviews(trendyol_product_id: str, reviews: list) -> dict:
@@ -121,8 +53,7 @@ def save_reviews(trendyol_product_id: str, reviews: list) -> dict:
             rv_id = row["id"]
             saved += 1
 
-            media_files = review.get("mediaFiles", [])
-            for media in media_files:
+            for media in review.get("mediaFiles", []):
                 if media.get("url"):
                     cur.execute("""
                         INSERT INTO "TrendyolReviewMedia"
@@ -160,47 +91,99 @@ def set_last_synced(trendyol_product_id: str, summary: dict = None):
     conn.close()
 
 
-async def process_product(browser, semaphore, product_row: dict, seller_id: str, index: int, total: int):
-    async with semaphore:
-        content_id = product_row["contentId"]
-        trendyol_product_id = product_row["id"]
+async def tab_worker(page, products: list, browser_id: int, tab_id: int, seller_id: str) -> dict:
+    total_saved = 0
+    total_skipped = 0
 
-        print(f"\n🔍 [{index}/{total}] ContentId: {content_id}")
+    for product in products:
+        content_id = product["contentId"]
+        trendyol_product_id = product["id"]
+        url = f"https://www.trendyol.com/ty/ty-p-{content_id}/yorumlar"
 
-        if product_row["lastSyncedAt"] is not None:
-            print(f"  ⏭️ [{index}/{total}] Zaten çekilmiş, atlanıyor")
-            return {"saved": 0, "skipped": 0}
+        result = {}
 
-        page = await browser.new_page()
+        async def on_response(response):
+            if (
+                REVIEW_API_PATTERN in response.url
+                and f"contentId={content_id}" in response.url
+                and "page=0" in response.url
+                and "orderBy" not in response.url
+            ):
+                try:
+                    result["data"] = await response.json()
+                except:
+                    pass
+
+        page.on("response", on_response)
+
         try:
-            result = await fetch_reviews_for_product(page, content_id, seller_id=seller_id)
-        finally:
-            await page.close()
+            await page.goto(url, wait_until="networkidle", timeout=25000)
+            await page.wait_for_timeout(1000)
+        except Exception as e:
+            print(f"[B{browser_id}T{tab_id}] ❌ {content_id}: {str(e)[:60]}")
 
-        reviews = result.get("reviews", [])
-        summary = result.get("summary", {})
+        page.remove_listener("response", on_response)
 
-        set_last_synced(trendyol_product_id, summary)
+        if "data" in result:
+            r = result["data"].get("result", {})
+            summary = r.get("summary", {})
+            reviews = r.get("reviews", [])
+            reviews = normalize_seller_filter(reviews, seller_id)
 
-        if not reviews:
-            print(f"  ℹ️ [{index}/{total}] Yorum yok")
-            return {"saved": 0, "skipped": 0}
+            set_last_synced(trendyol_product_id, summary)
 
-        stats = save_reviews(trendyol_product_id, reviews)
-        print(f"  ✅ [{index}/{total}] {stats['saved']} yorum kaydedildi")
-        return stats
+            if reviews:
+                stats = save_reviews(trendyol_product_id, reviews)
+                total_saved += stats["saved"]
+                total_skipped += stats["skipped"]
+                print(f"[B{browser_id}T{tab_id}] ✅ {content_id}: {stats['saved']} yorum")
+            else:
+                print(f"[B{browser_id}T{tab_id}] ℹ️ {content_id}: yorum yok")
+        else:
+            set_last_synced(trendyol_product_id)
+            print(f"[B{browser_id}T{tab_id}] ⚠️ {content_id}: veri gelmedi")
+
+    return {"total_saved": total_saved, "total_skipped": total_skipped}
+
+
+async def browser_worker(playwright, products: list, browser_id: int, seller_id: str) -> dict:
+    browser = await playwright.chromium.launch(headless=True)
+    context = await browser.new_context(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        locale="tr-TR",
+    )
+
+    chunks = [products[i::TABS] for i in range(TABS)]
+    pages = [await context.new_page() for _ in range(TABS)]
+
+    tasks = [
+        tab_worker(pages[i], chunks[i], browser_id, i + 1, seller_id)
+        for i in range(TABS)
+    ]
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    try:
+        await browser.close()
+    except:
+        pass
+
+    total_saved = 0
+    total_skipped = 0
+    for r in results:
+        if isinstance(r, dict):
+            total_saved += r.get("total_saved", 0)
+            total_skipped += r.get("total_skipped", 0)
+
+    return {"total_saved": total_saved, "total_skipped": total_skipped}
 
 
 async def _run_async(config_id: str, seller_id: str, content_ids: list) -> dict:
-    total_saved = 0
-    total_skipped = 0
-    total = len(content_ids)
-
-    # Tek sorguda tüm ürünleri çek
+    # DB'den tüm ürünleri çek
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        SELECT "contentId", id, "lastSyncedAt"
+        SELECT id, "contentId", "lastSyncedAt"
         FROM "TrendyolProduct"
         WHERE "configId" = %s
     """, (config_id,))
@@ -208,43 +191,40 @@ async def _run_async(config_id: str, seller_id: str, content_ids: list) -> dict:
     cur.close()
     conn.close()
 
-    # Sadece çekilmemiş olanları filtrele
+    # Zaten çekilmişleri filtrele
     remaining = []
     skipped_count = 0
     for product in content_ids:
         content_id = product if isinstance(product, str) else product.get("contentId")
         row = all_products.get(content_id)
-        if not row:
-            continue
-        if row["lastSyncedAt"] is not None:
+        if not row or row["lastSyncedAt"] is not None:
             skipped_count += 1
             continue
         remaining.append(row)
 
-    print(f"  ⏭️ {skipped_count} ürün zaten çekilmiş, atlanıyor")
+    print(f"  ⏭️ {skipped_count} zaten çekilmiş, atlanıyor")
     print(f"  🔍 {len(remaining)} ürün çekilecek")
 
     if not remaining:
         return {"total_saved": 0, "total_skipped": skipped_count}
 
-    semaphore = asyncio.Semaphore(PARALLEL_TABS)
+    # Browser'lara böl
+    chunks = [remaining[i::BROWSERS] for i in range(BROWSERS)]
+
+    total_saved = 0
+    total_skipped = 0
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-
-        tasks = []
-        for i, product_row in enumerate(remaining):
-            task = process_product(browser, semaphore, product_row, seller_id, i + 1, len(remaining))
-            tasks.append(task)
-
+        tasks = [
+            browser_worker(p, chunks[b], b + 1, seller_id)
+            for b in range(BROWSERS)
+        ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        await browser.close()
 
     for r in results:
         if isinstance(r, dict):
-            total_saved += r.get("saved", 0)
-            total_skipped += r.get("skipped", 0)
+            total_saved += r.get("total_saved", 0)
+            total_skipped += r.get("total_skipped", 0)
 
     return {"total_saved": total_saved, "total_skipped": total_skipped}
 
