@@ -3,8 +3,8 @@ import concurrent.futures
 from playwright.async_api import async_playwright
 from db import get_connection
 
-BROWSERS = 2
-TABS = 3  # 2×3 = 6 paralel
+BROWSERS = 5
+TABS = 6  # 5×6 = 30 paralel
 REVIEW_API_PATTERN = "review-read/product-reviews/detailed"
 
 
@@ -100,6 +100,8 @@ async def tab_worker(page, products: list, browser_id: int, tab_id: int, seller_
         trendyol_product_id = product["id"]
         url = f"https://www.trendyol.com/ty/ty-p-{content_id}/yorumlar"
 
+        print(f"[B{browser_id}T{tab_id}] 🌐 {url}")
+
         result = {}
 
         async def on_response(response):
@@ -109,6 +111,7 @@ async def tab_worker(page, products: list, browser_id: int, tab_id: int, seller_
                 and "page=0" in response.url
                 and "orderBy" not in response.url
             ):
+                print(f"[B{browser_id}T{tab_id}] 📡 API: {response.url[:100]}")
                 try:
                     result["data"] = await response.json()
                 except:
@@ -120,7 +123,7 @@ async def tab_worker(page, products: list, browser_id: int, tab_id: int, seller_
             await page.goto(url, wait_until="networkidle", timeout=25000)
             await page.wait_for_timeout(1000)
         except Exception as e:
-            print(f"[B{browser_id}T{tab_id}] ❌ {content_id}: {str(e)[:60]}")
+            print(f"[B{browser_id}T{tab_id}] ❌ Timeout: {content_id} — {str(e)[:80]}")
 
         page.remove_listener("response", on_response)
 
@@ -128,7 +131,10 @@ async def tab_worker(page, products: list, browser_id: int, tab_id: int, seller_
             r = result["data"].get("result", {})
             summary = r.get("summary", {})
             reviews = r.get("reviews", [])
+            total_count = summary.get("totalCommentCount", 0)
+            avg = summary.get("averageRating", 0)
             reviews = normalize_seller_filter(reviews, seller_id)
+            filtered_out = total_count - len(reviews)
 
             set_last_synced(trendyol_product_id, summary)
 
@@ -136,25 +142,36 @@ async def tab_worker(page, products: list, browser_id: int, tab_id: int, seller_
                 stats = save_reviews(trendyol_product_id, reviews)
                 total_saved += stats["saved"]
                 total_skipped += stats["skipped"]
-                print(f"[B{browser_id}T{tab_id}] ✅ {content_id}: {stats['saved']} yorum")
+                msg = f"[B{browser_id}T{tab_id}] ✅ {content_id}: {stats['saved']} yorum | ort: {avg}"
+                if filtered_out > 0:
+                    msg += f" | {filtered_out} başka satıcı filtrelendi"
+                print(msg)
             else:
-                print(f"[B{browser_id}T{tab_id}] ℹ️ {content_id}: yorum yok")
+                if total_count > 0:
+                    print(f"[B{browser_id}T{tab_id}] ⚠️ {content_id}: {total_count} yorum var ama hepsi başka satıcıya ait")
+                else:
+                    print(f"[B{browser_id}T{tab_id}] ℹ️ {content_id}: yorum yok")
         else:
             set_last_synced(trendyol_product_id)
-            print(f"[B{browser_id}T{tab_id}] ⚠️ {content_id}: veri gelmedi")
+            print(f"[B{browser_id}T{tab_id}] ⚠️ {content_id}: API yanıtı gelmedi")
 
     return {"total_saved": total_saved, "total_skipped": total_skipped}
 
 
 async def browser_worker(playwright, products: list, browser_id: int, seller_id: str) -> dict:
+    print(f"[B{browser_id}] 🚀 Browser başlatılıyor — {len(products)} ürün, {TABS} tab")
     browser = await playwright.chromium.launch(headless=True)
     context = await browser.new_context(
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         locale="tr-TR",
     )
 
     chunks = [products[i::TABS] for i in range(TABS)]
     pages = [await context.new_page() for _ in range(TABS)]
+
+    print(f"[B{browser_id}] 📑 {TABS} tab açıldı")
+    for i, chunk in enumerate(chunks):
+        print(f"[B{browser_id}T{i+1}] {len(chunk)} ürün işlenecek")
 
     tasks = [
         tab_worker(pages[i], chunks[i], browser_id, i + 1, seller_id)
@@ -165,8 +182,9 @@ async def browser_worker(playwright, products: list, browser_id: int, seller_id:
 
     try:
         await browser.close()
-    except:
-        pass
+        print(f"[B{browser_id}] ✅ Browser kapatıldı")
+    except Exception as e:
+        print(f"[B{browser_id}] ⚠️ Browser kapatma hatası: {e}")
 
     total_saved = 0
     total_skipped = 0
@@ -174,12 +192,14 @@ async def browser_worker(playwright, products: list, browser_id: int, seller_id:
         if isinstance(r, dict):
             total_saved += r.get("total_saved", 0)
             total_skipped += r.get("total_skipped", 0)
+        elif isinstance(r, Exception):
+            print(f"[B{browser_id}] ❌ Tab hatası: {r}")
 
+    print(f"[B{browser_id}] 📊 Toplam: {total_saved} yorum kaydedildi")
     return {"total_saved": total_saved, "total_skipped": total_skipped}
 
 
 async def _run_async(config_id: str, seller_id: str, content_ids: list) -> dict:
-    # DB'den tüm ürünleri çek
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
@@ -191,7 +211,6 @@ async def _run_async(config_id: str, seller_id: str, content_ids: list) -> dict:
     cur.close()
     conn.close()
 
-    # Zaten çekilmişleri filtrele
     remaining = []
     skipped_count = 0
     for product in content_ids:
@@ -203,12 +222,11 @@ async def _run_async(config_id: str, seller_id: str, content_ids: list) -> dict:
         remaining.append(row)
 
     print(f"  ⏭️ {skipped_count} zaten çekilmiş, atlanıyor")
-    print(f"  🔍 {len(remaining)} ürün çekilecek")
+    print(f"  🔍 {len(remaining)} ürün çekilecek — {BROWSERS} browser × {TABS} tab = {BROWSERS*TABS} paralel")
 
     if not remaining:
         return {"total_saved": 0, "total_skipped": skipped_count}
 
-    # Browser'lara böl
     chunks = [remaining[i::BROWSERS] for i in range(BROWSERS)]
 
     total_saved = 0
