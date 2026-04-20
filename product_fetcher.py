@@ -33,6 +33,8 @@ def fetch_all_content_ids(seller_id: str, api_key: str, api_secret: str) -> list
             products = data.get("content", [])
 
             for p in products:
+                if not p.get("onSale", False):
+                    continue
                 cid = str(p.get("productContentId", ""))
                 if cid and cid not in content_id_map:
                     images = p.get("images", [])
