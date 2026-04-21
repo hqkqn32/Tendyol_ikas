@@ -1,9 +1,7 @@
 import requests
 import base64
 
-SELLER_ID  = "212112"
-API_KEY    = "bxb4SJ75WJdnUB3IJuLP"
-API_SECRET = "nN5FmdIeKwHL9RSNcWqd"
+
 
 def get_auth_header():
     credentials = f"{API_KEY}:{API_SECRET}"
