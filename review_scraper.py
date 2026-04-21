@@ -1,14 +1,16 @@
 import asyncio
 import concurrent.futures
-from playwright.async_api import async_playwright
+import httpx
 from db import get_connection
 
-BROWSERS = 5
-TABS = 6  # 5×6 = 30 paralel
-REVIEW_API_PATTERN = "review-read/product-reviews/detailed"
+# Playwright KALDIRILDI - Artık direkt JSON API kullanılıyor
+CONCURRENT_REQUESTS = 50  # Aynı anda 50 paralel istek
 
 
 def normalize_seller_filter(reviews: list, seller_id: str) -> list:
+    """
+    Sadece belirtilen seller_id'ye ait yorumları filtreler
+    """
     return [
         r for r in reviews
         if str(r.get("seller", {}).get("id", "")) == str(seller_id)
@@ -16,6 +18,10 @@ def normalize_seller_filter(reviews: list, seller_id: str) -> list:
 
 
 def save_reviews(trendyol_product_id: str, reviews: list) -> dict:
+    """
+    Yorumları ve medya dosyalarını DB'ye kaydeder
+    ON CONFLICT ile duplicate kontrolü yapar
+    """
     conn = get_connection()
     cur = conn.cursor()
     saved = 0
@@ -53,6 +59,7 @@ def save_reviews(trendyol_product_id: str, reviews: list) -> dict:
             rv_id = row["id"]
             saved += 1
 
+            # Medya dosyalarını kaydet
             for media in review.get("mediaFiles", []):
                 if media.get("url"):
                     cur.execute("""
@@ -72,6 +79,9 @@ def save_reviews(trendyol_product_id: str, reviews: list) -> dict:
 
 
 def set_last_synced(trendyol_product_id: str, summary: dict = None):
+    """
+    TrendyolProduct tablosunda lastSyncedAt, avgRating ve reviewCount günceller
+    """
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
@@ -91,115 +101,157 @@ def set_last_synced(trendyol_product_id: str, summary: dict = None):
     conn.close()
 
 
-async def tab_worker(page, products: list, browser_id: int, tab_id: int, seller_id: str) -> dict:
+async def fetch_reviews_direct(
+    content_id: str, 
+    trendyol_product_id: str, 
+    seller_id: str, 
+    worker_id: int
+) -> dict:
+    """
+    Direkt JSON API'den yorumları çeker (Playwright kullanmadan)
+    
+    Args:
+        content_id: Trendyol ürün content ID
+        trendyol_product_id: DB'deki TrendyolProduct.id (UUID)
+        seller_id: Seller ID (filtreleme için)
+        worker_id: Log için worker numarası
+    
+    Returns:
+        {"total_saved": int, "total_skipped": int}
+    """
+    api_url = (
+        f"https://public.trendyol.com/discovery-web-productreviewgateway-service/api/"
+        f"review-read/product-reviews/detailed"
+        f"?contentId={content_id}&page=0&culture=tr-TR"
+    )
+    
     total_saved = 0
     total_skipped = 0
 
-    for product in products:
-        content_id = product["contentId"]
-        trendyol_product_id = product["id"]
-        url = f"https://www.trendyol.com/ty/ty-p-{content_id}/yorumlar"
-
-        print(f"[B{browser_id}T{tab_id}] 🌐 {url}")
-
-        result = {}
-
-        async def on_response(response):
-            if (
-                REVIEW_API_PATTERN in response.url
-                and f"contentId={content_id}" in response.url
-                and "page=0" in response.url
-                and "orderBy" not in response.url
-            ):
-                print(f"[B{browser_id}T{tab_id}] 📡 API: {response.url[:100]}")
-                try:
-                    result["data"] = await response.json()
-                except:
-                    pass
-
-        page.on("response", on_response)
-
-        try:
-            await page.goto(url, wait_until="networkidle", timeout=25000)
-            await page.wait_for_timeout(1000)
-        except Exception as e:
-            print(f"[B{browser_id}T{tab_id}] ❌ Timeout: {content_id} — {str(e)[:80]}")
-
-        page.remove_listener("response", on_response)
-
-        if "data" in result:
-            r = result["data"].get("result", {})
-            summary = r.get("summary", {})
-            reviews = r.get("reviews", [])
-            total_count = summary.get("totalCommentCount", 0)
-            avg = summary.get("averageRating", 0)
-            reviews = normalize_seller_filter(reviews, seller_id)
-            filtered_out = total_count - len(reviews)
-
-            set_last_synced(trendyol_product_id, summary)
-
-            if reviews:
-                stats = save_reviews(trendyol_product_id, reviews)
-                total_saved += stats["saved"]
-                total_skipped += stats["skipped"]
-                msg = f"[B{browser_id}T{tab_id}] ✅ {content_id}: {stats['saved']} yorum | ort: {avg}"
-                if filtered_out > 0:
-                    msg += f" | {filtered_out} başka satıcı filtrelendi"
-                print(msg)
-            else:
-                if total_count > 0:
-                    print(f"[B{browser_id}T{tab_id}] ⚠️ {content_id}: {total_count} yorum var ama hepsi başka satıcıya ait")
-                else:
-                    print(f"[B{browser_id}T{tab_id}] ℹ️ {content_id}: yorum yok")
+    try:
+        print(f"[W{worker_id}] 🌐 {content_id} → JSON API")
+        
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(api_url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "application/json",
+                "Accept-Language": "tr-TR,tr;q=0.9",
+            })
+            
+            if response.status_code != 200:
+                print(f"[W{worker_id}] ❌ {content_id}: HTTP {response.status_code}")
+                set_last_synced(trendyol_product_id)
+                return {"total_saved": 0, "total_skipped": 0}
+            
+            data = response.json()
+        
+        # Response'u parse et
+        result = data.get("result", {})
+        summary = result.get("summary", {})
+        all_reviews = result.get("reviews", [])
+        total_count = summary.get("totalCommentCount", 0)
+        avg = summary.get("averageRating", 0)
+        
+        # Seller'a ait yorumları filtrele
+        filtered_reviews = normalize_seller_filter(all_reviews, seller_id)
+        filtered_out = total_count - len(filtered_reviews)
+        
+        # lastSyncedAt güncelle
+        set_last_synced(trendyol_product_id, summary)
+        
+        # Yorumları DB'ye kaydet
+        if filtered_reviews:
+            stats = save_reviews(trendyol_product_id, filtered_reviews)
+            total_saved += stats["saved"]
+            total_skipped += stats["skipped"]
+            
+            msg = f"[W{worker_id}] ✅ {content_id}: {stats['saved']} yorum | ort: {avg}"
+            if filtered_out > 0:
+                msg += f" | {filtered_out} başka satıcı filtrelendi"
+            print(msg)
         else:
-            set_last_synced(trendyol_product_id)
-            print(f"[B{browser_id}T{tab_id}] ⚠️ {content_id}: API yanıtı gelmedi")
-
+            if total_count > 0:
+                print(f"[W{worker_id}] ⚠️ {content_id}: {total_count} yorum var ama hepsi başka satıcıya ait")
+            else:
+                print(f"[W{worker_id}] ℹ️ {content_id}: yorum yok")
+    
+    except httpx.TimeoutException:
+        print(f"[W{worker_id}] ⏱️ {content_id}: Timeout (15s)")
+        set_last_synced(trendyol_product_id)
+    except httpx.HTTPError as e:
+        print(f"[W{worker_id}] ❌ {content_id}: HTTP Error — {str(e)[:80]}")
+        set_last_synced(trendyol_product_id)
+    except Exception as e:
+        print(f"[W{worker_id}] ❌ {content_id}: Hata — {str(e)[:80]}")
+        set_last_synced(trendyol_product_id)
+    
     return {"total_saved": total_saved, "total_skipped": total_skipped}
 
 
-async def browser_worker(playwright, products: list, browser_id: int, seller_id: str) -> dict:
-    print(f"[B{browser_id}] 🚀 Browser başlatılıyor — {len(products)} ürün, {TABS} tab")
-    browser = await playwright.chromium.launch(headless=True)
-    context = await browser.new_context(
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        locale="tr-TR",
-    )
-
-    chunks = [products[i::TABS] for i in range(TABS)]
-    pages = [await context.new_page() for _ in range(TABS)]
-
-    print(f"[B{browser_id}] 📑 {TABS} tab açıldı")
-    for i, chunk in enumerate(chunks):
-        print(f"[B{browser_id}T{i+1}] {len(chunk)} ürün işlenecek")
-
+async def worker_pool(products: list, seller_id: str) -> dict:
+    """
+    Ürünleri paralel olarak işler
+    Semaphore ile CONCURRENT_REQUESTS kadar eşzamanlı istek sınırı koyar
+    
+    Args:
+        products: İşlenecek ürün listesi (her biri {"id": UUID, "contentId": str})
+        seller_id: Seller ID
+    
+    Returns:
+        {"total_saved": int, "total_skipped": int}
+    """
+    semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
+    
+    async def bounded_fetch(product: dict, worker_id: int):
+        """Semaphore ile sınırlandırılmış fetch"""
+        async with semaphore:
+            return await fetch_reviews_direct(
+                content_id=product["contentId"],
+                trendyol_product_id=product["id"],
+                seller_id=seller_id,
+                worker_id=worker_id
+            )
+    
+    # Tüm ürünler için task oluştur
     tasks = [
-        tab_worker(pages[i], chunks[i], browser_id, i + 1, seller_id)
-        for i in range(TABS)
+        bounded_fetch(product, i + 1)
+        for i, product in enumerate(products)
     ]
-
+    
+    # Paralel olarak çalıştır
     results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    try:
-        await browser.close()
-        print(f"[B{browser_id}] ✅ Browser kapatıldı")
-    except Exception as e:
-        print(f"[B{browser_id}] ⚠️ Browser kapatma hatası: {e}")
-
+    
+    # Sonuçları topla
     total_saved = 0
     total_skipped = 0
+    
     for r in results:
         if isinstance(r, dict):
             total_saved += r.get("total_saved", 0)
             total_skipped += r.get("total_skipped", 0)
         elif isinstance(r, Exception):
-            print(f"[B{browser_id}] ❌ Tab hatası: {r}")
-
-    print(f"[B{browser_id}] 📊 Toplam: {total_saved} yorum kaydedildi")
+            print(f"❌ Worker hatası: {r}")
+    
     return {"total_saved": total_saved, "total_skipped": total_skipped}
 
 
 async def _run_async(config_id: str, seller_id: str, content_ids: list) -> dict:
+    """
+    Ana scraping mantığı
+    
+    1. DB'den TrendyolProduct tablosunu çek
+    2. Zaten çekilmiş olanları filtrele (lastSyncedAt != NULL)
+    3. Kalan ürünleri paralel olarak işle
+    
+    Args:
+        config_id: TrendyolConfig UUID
+        seller_id: Trendyol Seller ID
+        content_ids: İşlenecek content ID listesi
+    
+    Returns:
+        {"total_saved": int, "total_skipped": int}
+    """
+    # DB'den ürünleri çek
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
@@ -211,6 +263,7 @@ async def _run_async(config_id: str, seller_id: str, content_ids: list) -> dict:
     cur.close()
     conn.close()
 
+    # Zaten çekilmiş olanları filtrele
     remaining = []
     skipped_count = 0
     for product in content_ids:
@@ -222,36 +275,45 @@ async def _run_async(config_id: str, seller_id: str, content_ids: list) -> dict:
         remaining.append(row)
 
     print(f"  ⏭️ {skipped_count} zaten çekilmiş, atlanıyor")
-    print(f"  🔍 {len(remaining)} ürün çekilecek — {BROWSERS} browser × {TABS} tab = {BROWSERS*TABS} paralel")
+    print(f"  🔍 {len(remaining)} ürün çekilecek — {CONCURRENT_REQUESTS} paralel istek")
 
     if not remaining:
         return {"total_saved": 0, "total_skipped": skipped_count}
 
-    chunks = [remaining[i::BROWSERS] for i in range(BROWSERS)]
-
-    total_saved = 0
-    total_skipped = 0
-
-    async with async_playwright() as p:
-        tasks = [
-            browser_worker(p, chunks[b], b + 1, seller_id)
-            for b in range(BROWSERS)
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    for r in results:
-        if isinstance(r, dict):
-            total_saved += r.get("total_saved", 0)
-            total_skipped += r.get("total_skipped", 0)
-
-    return {"total_saved": total_saved, "total_skipped": total_skipped}
+    # Worker pool ile paralel işle
+    result = await worker_pool(remaining, seller_id)
+    
+    print(f"\n📊 TOPLAM: {result['total_saved']} yorum kaydedildi, {result['total_skipped']} duplicate atlandı")
+    
+    return result
 
 
 def _run_sync(config_id: str, seller_id: str, content_ids: list) -> dict:
+    """
+    Async fonksiyonu sync wrapper ile çalıştır
+    """
     return asyncio.run(_run_async(config_id, seller_id, content_ids))
 
 
 async def run(config_id: str, seller_id: str, content_ids: list) -> dict:
+    """
+    Ana entry point - FastAPI'den çağrılır
+    
+    Args:
+        config_id: TrendyolConfig UUID
+        seller_id: Trendyol Seller ID (örn: "212112")
+        content_ids: İşlenecek content ID listesi (örn: ["12345", "67890"])
+    
+    Returns:
+        {"total_saved": int, "total_skipped": int}
+    
+    Örnek:
+        result = await scraper.run(
+            config_id="abc-123",
+            seller_id="212112",
+            content_ids=["12345", "67890"]
+        )
+    """
     loop = asyncio.get_event_loop()
     with concurrent.futures.ThreadPoolExecutor() as pool:
         result = await loop.run_in_executor(
