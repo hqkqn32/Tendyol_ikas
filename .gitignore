@@ -1,5 +1,38 @@
-.env
+# Python
 __pycache__/
-*.pyc
-.playwright/
+*.py[cod]
+*$py.class
+*.so
+.Python
 venv/
+env/
+ENV/
+
+# Environment
+.env
+.env.local
+
+# Logs
+*.log
+logs/
+
+# Test outputs
+test_output.json
+seller_reviews_*.json
+firibu_reviews.json
+current_products.json
+reviews_*.json
+captured_api.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+docker-compose.override.yml

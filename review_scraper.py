@@ -1,323 +1,311 @@
 import asyncio
 import concurrent.futures
-import httpx
+import time
+import requests
+from playwright.async_api import async_playwright
 from db import get_connection
-
-# Playwright KALDIRILDI - Artık direkt JSON API kullanılıyor
-CONCURRENT_REQUESTS = 50  # Aynı anda 50 paralel istek
+from telegram_notifier import notify_error
 
 
-def normalize_seller_filter(reviews: list, seller_id: str) -> list:
+async def get_cookies():
     """
-    Sadece belirtilen seller_id'ye ait yorumları filtreler
+    Playwright ile Trendyol'a gir, cookie'leri al
     """
-    return [
-        r for r in reviews
-        if str(r.get("seller", {}).get("id", "")) == str(seller_id)
-    ]
-
-
-def save_reviews(trendyol_product_id: str, reviews: list) -> dict:
-    """
-    Yorumları ve medya dosyalarını DB'ye kaydeder
-    ON CONFLICT ile duplicate kontrolü yapar
-    """
-    conn = get_connection()
-    cur = conn.cursor()
-    saved = 0
-    skipped = 0
-
-    for review in reviews:
-        review_id = review.get("id")
-        if not review_id:
-            continue
-
-        try:
-            cur.execute("""
-                INSERT INTO "TrendyolReview"
-                    (id, "trendyolProductId", "trendyolId", rate, comment, "userFullName",
-                     "productSize", trusted, "createdAt")
-                VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT ("trendyolId") DO NOTHING
-                RETURNING id
-            """, (
-                trendyol_product_id,
-                review_id,
-                review.get("rate", 5),
-                review.get("comment"),
-                review.get("userFullName"),
-                review.get("productSize"),
-                review.get("trusted", False),
-                review.get("createdAt", 0),
-            ))
-
-            row = cur.fetchone()
-            if not row:
-                skipped += 1
-                continue
-
-            rv_id = row["id"]
-            saved += 1
-
-            # Medya dosyalarını kaydet
-            for media in review.get("mediaFiles", []):
-                if media.get("url"):
-                    cur.execute("""
-                        INSERT INTO "TrendyolReviewMedia"
-                            (id, "reviewId", url, "thumbnailUrl", "createdAt")
-                        VALUES (gen_random_uuid(), %s, %s, %s, NOW())
-                    """, (rv_id, media.get("url"), media.get("thumbnailUrl")))
-
-        except Exception as e:
-            print(f"⚠️ Review kayıt hatası {review_id}: {e}")
-            continue
-
-    conn.commit()
-    cur.close()
-    conn.close()
-    return {"saved": saved, "skipped": skipped}
-
-
-def set_last_synced(trendyol_product_id: str, summary: dict = None):
-    """
-    TrendyolProduct tablosunda lastSyncedAt, avgRating ve reviewCount günceller
-    """
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE "TrendyolProduct" SET
-            "avgRating" = %s,
-            "reviewCount" = %s,
-            "lastSyncedAt" = NOW(),
-            "updatedAt" = NOW()
-        WHERE id = %s
-    """, (
-        summary.get("averageRating") if summary else None,
-        summary.get("totalCommentCount", 0) if summary else 0,
-        trendyol_product_id,
-    ))
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
-async def fetch_reviews_direct(
-    content_id: str, 
-    trendyol_product_id: str, 
-    seller_id: str, 
-    worker_id: int
-) -> dict:
-    """
-    Direkt JSON API'den yorumları çeker (Playwright kullanmadan)
-    
-    Args:
-        content_id: Trendyol ürün content ID
-        trendyol_product_id: DB'deki TrendyolProduct.id (UUID)
-        seller_id: Seller ID (filtreleme için)
-        worker_id: Log için worker numarası
-    
-    Returns:
-        {"total_saved": int, "total_skipped": int}
-    """
-    api_url = (
-        f"https://public.trendyol.com/discovery-web-productreviewgateway-service/api/"
-        f"review-read/product-reviews/detailed"
-        f"?contentId={content_id}&page=0&culture=tr-TR"
-    )
-    
-    total_saved = 0
-    total_skipped = 0
-
-    try:
-        print(f"[W{worker_id}] 🌐 {content_id} → JSON API")
-        
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.get(api_url, headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "application/json",
-                "Accept-Language": "tr-TR,tr;q=0.9",
-            })
-            
-            if response.status_code != 200:
-                print(f"[W{worker_id}] ❌ {content_id}: HTTP {response.status_code}")
-                set_last_synced(trendyol_product_id)
-                return {"total_saved": 0, "total_skipped": 0}
-            
-            data = response.json()
-        
-        # Response'u parse et
-        result = data.get("result", {})
-        summary = result.get("summary", {})
-        all_reviews = result.get("reviews", [])
-        total_count = summary.get("totalCommentCount", 0)
-        avg = summary.get("averageRating", 0)
-        
-        # Seller'a ait yorumları filtrele
-        filtered_reviews = normalize_seller_filter(all_reviews, seller_id)
-        filtered_out = total_count - len(filtered_reviews)
-        
-        # lastSyncedAt güncelle
-        set_last_synced(trendyol_product_id, summary)
-        
-        # Yorumları DB'ye kaydet
-        if filtered_reviews:
-            stats = save_reviews(trendyol_product_id, filtered_reviews)
-            total_saved += stats["saved"]
-            total_skipped += stats["skipped"]
-            
-            msg = f"[W{worker_id}] ✅ {content_id}: {stats['saved']} yorum | ort: {avg}"
-            if filtered_out > 0:
-                msg += f" | {filtered_out} başka satıcı filtrelendi"
-            print(msg)
-        else:
-            if total_count > 0:
-                print(f"[W{worker_id}] ⚠️ {content_id}: {total_count} yorum var ama hepsi başka satıcıya ait")
-            else:
-                print(f"[W{worker_id}] ℹ️ {content_id}: yorum yok")
-    
-    except httpx.TimeoutException:
-        print(f"[W{worker_id}] ⏱️ {content_id}: Timeout (15s)")
-        set_last_synced(trendyol_product_id)
-    except httpx.HTTPError as e:
-        print(f"[W{worker_id}] ❌ {content_id}: HTTP Error — {str(e)[:80]}")
-        set_last_synced(trendyol_product_id)
-    except Exception as e:
-        print(f"[W{worker_id}] ❌ {content_id}: Hata — {str(e)[:80]}")
-        set_last_synced(trendyol_product_id)
-    
-    return {"total_saved": total_saved, "total_skipped": total_skipped}
-
-
-async def worker_pool(products: list, seller_id: str) -> dict:
-    """
-    Ürünleri paralel olarak işler
-    Semaphore ile CONCURRENT_REQUESTS kadar eşzamanlı istek sınırı koyar
-    
-    Args:
-        products: İşlenecek ürün listesi (her biri {"id": UUID, "contentId": str})
-        seller_id: Seller ID
-    
-    Returns:
-        {"total_saved": int, "total_skipped": int}
-    """
-    semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
-    
-    async def bounded_fetch(product: dict, worker_id: int):
-        """Semaphore ile sınırlandırılmış fetch"""
-        async with semaphore:
-            return await fetch_reviews_direct(
-                content_id=product["contentId"],
-                trendyol_product_id=product["id"],
-                seller_id=seller_id,
-                worker_id=worker_id
-            )
-    
-    # Tüm ürünler için task oluştur
-    tasks = [
-        bounded_fetch(product, i + 1)
-        for i, product in enumerate(products)
-    ]
-    
-    # Paralel olarak çalıştır
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    # Sonuçları topla
-    total_saved = 0
-    total_skipped = 0
-    
-    for r in results:
-        if isinstance(r, dict):
-            total_saved += r.get("total_saved", 0)
-            total_skipped += r.get("total_skipped", 0)
-        elif isinstance(r, Exception):
-            print(f"❌ Worker hatası: {r}")
-    
-    return {"total_saved": total_saved, "total_skipped": total_skipped}
-
-
-async def _run_async(config_id: str, seller_id: str, content_ids: list) -> dict:
-    """
-    Ana scraping mantığı
-    
-    1. DB'den TrendyolProduct tablosunu çek
-    2. Zaten çekilmiş olanları filtrele (lastSyncedAt != NULL)
-    3. Kalan ürünleri paralel olarak işle
-    
-    Args:
-        config_id: TrendyolConfig UUID
-        seller_id: Trendyol Seller ID
-        content_ids: İşlenecek content ID listesi
-    
-    Returns:
-        {"total_saved": int, "total_skipped": int}
-    """
-    # DB'den ürünleri çek
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT id, "contentId", "lastSyncedAt"
-        FROM "TrendyolProduct"
-        WHERE "configId" = %s
-    """, (config_id,))
-    all_products = {row["contentId"]: dict(row) for row in cur.fetchall()}
-    cur.close()
-    conn.close()
-
-    # Zaten çekilmiş olanları filtrele
-    remaining = []
-    skipped_count = 0
-    for product in content_ids:
-        content_id = product if isinstance(product, str) else product.get("contentId")
-        row = all_products.get(content_id)
-        if not row or row["lastSyncedAt"] is not None:
-            skipped_count += 1
-            continue
-        remaining.append(row)
-
-    print(f"  ⏭️ {skipped_count} zaten çekilmiş, atlanıyor")
-    print(f"  🔍 {len(remaining)} ürün çekilecek — {CONCURRENT_REQUESTS} paralel istek")
-
-    if not remaining:
-        return {"total_saved": 0, "total_skipped": skipped_count}
-
-    # Worker pool ile paralel işle
-    result = await worker_pool(remaining, seller_id)
-    
-    print(f"\n📊 TOPLAM: {result['total_saved']} yorum kaydedildi, {result['total_skipped']} duplicate atlandı")
-    
-    return result
-
-
-def _run_sync(config_id: str, seller_id: str, content_ids: list) -> dict:
-    """
-    Async fonksiyonu sync wrapper ile çalıştır
-    """
-    return asyncio.run(_run_async(config_id, seller_id, content_ids))
-
-
-async def run(config_id: str, seller_id: str, content_ids: list) -> dict:
-    """
-    Ana entry point - FastAPI'den çağrılır
-    
-    Args:
-        config_id: TrendyolConfig UUID
-        seller_id: Trendyol Seller ID (örn: "212112")
-        content_ids: İşlenecek content ID listesi (örn: ["12345", "67890"])
-    
-    Returns:
-        {"total_saved": int, "total_skipped": int}
-    
-    Örnek:
-        result = await scraper.run(
-            config_id="abc-123",
-            seller_id="212112",
-            content_ids=["12345", "67890"]
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+            locale="tr-TR",
         )
+        page = await context.new_page()
+        await page.goto("https://www.trendyol.com", wait_until="networkidle", timeout=30000)
+        await asyncio.sleep(2)
+        cookies = await context.cookies()
+        await browser.close()
+        cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+        return cookie_str
+
+
+def get_reviews_page(page: int, seller_id: str, cookie_str: str, size: int = 20):
+    """
+    API'den bir sayfa yorum çek
+    """
+    url = f"https://apigw.trendyol.com/discovery-sellerstore-gateway-service/api/ugc/product-reviews"
+    url += f"?sellerId={seller_id}&page={page}&size={size}&isMarketplaceMember=true&culture=tr-TR"
+    
+    headers = {
+        "accept": "application/json",
+        "accept-language": "tr-TR,tr;q=0.9",
+        "cache-control": "no-cache",
+        "content-type": "application/json",
+        "cookie": cookie_str,
+        "origin": "https://www.trendyol.com",
+        "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        raise Exception(f"API request failed: {str(e)}")
+
+
+def filter_by_seller(reviews: list, seller_id: str) -> tuple:
+    """
+    Yorumları seller_id'ye göre filtrele
+    """
+    filtered = []
+    filtered_out = 0
+    
+    for review in reviews:
+        product = review.get("product", {})
+        link = product.get("link", "")
+        
+        if f"merchantId={seller_id}" in link:
+            filtered.append(review)
+        else:
+            filtered_out += 1
+    
+    return filtered, filtered_out
+
+
+def save_or_update_product(config_id: str, review: dict) -> str:
+    """
+    Ürünü DB'ye kaydet veya güncelle
+    """
+    product = review.get("product", {})
+    content_id = str(review.get("contentId", ""))
+    
+    if not content_id:
+        return None
+    
+    conn = get_connection()
+    cur = conn.cursor()
+    
+    try:
+        cur.execute("""
+            SELECT id FROM "TrendyolProduct"
+            WHERE "configId" = %s AND "contentId" = %s
+        """, (config_id, content_id))
+        
+        existing = cur.fetchone()
+        
+        product_name = product.get("title", "")
+        image_url = product.get("image")
+        avg_rating = product.get("rating", {}).get("average")
+        review_count = product.get("rating", {}).get("total", 0)
+        
+        if existing:
+            cur.execute("""
+                UPDATE "TrendyolProduct" SET
+                    "productName" = %s,
+                    "imageUrl" = %s,
+                    "avgRating" = %s,
+                    "reviewCount" = %s,
+                    "updatedAt" = NOW()
+                WHERE id = %s
+                RETURNING id
+            """, (product_name, image_url, avg_rating, review_count, existing["id"]))
+            
+            result = cur.fetchone()
+            product_id = result["id"] if result else existing["id"]
+        else:
+            cur.execute("""
+                INSERT INTO "TrendyolProduct"
+                    (id, "configId", "contentId", "productName", "imageUrl", 
+                     "avgRating", "reviewCount", "createdAt", "updatedAt")
+                VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                RETURNING id
+            """, (config_id, content_id, product_name, image_url, avg_rating, review_count))
+            
+            result = cur.fetchone()
+            product_id = result["id"]
+        
+        conn.commit()
+        return product_id
+        
+    except Exception as e:
+        conn.rollback()
+        raise Exception(f"Product save failed for {content_id}: {str(e)}")
+    finally:
+        cur.close()
+        conn.close()
+
+
+def save_review(trendyol_product_id: str, review: dict) -> bool:
+    """
+    Yorumu ve görsellerini DB'ye kaydet
+    """
+    review_id = review.get("id")
+    if not review_id or not trendyol_product_id:
+        return False
+    
+    conn = get_connection()
+    cur = conn.cursor()
+    
+    try:
+        cur.execute("""
+            INSERT INTO "TrendyolReview"
+                (id, "trendyolProductId", "trendyolId", rate, comment, "userFullName",
+                 "productSize", trusted, "createdAt")
+            VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT ("trendyolId") DO NOTHING
+            RETURNING id
+        """, (
+            trendyol_product_id,
+            review_id,
+            review.get("rate", 5),
+            review.get("comment"),
+            review.get("userFullName"),
+            review.get("productSize"),
+            review.get("trusted", False),
+            review.get("createdDate", 0),
+        ))
+        
+        result = cur.fetchone()
+        if not result:
+            conn.rollback()
+            return False
+        
+        saved_review_id = result["id"]
+        
+        media_files = review.get("mediaFiles", [])
+        for media in media_files:
+            if media.get("url"):
+                cur.execute("""
+                    INSERT INTO "TrendyolReviewMedia"
+                        (id, "reviewId", url, "thumbnailUrl", "createdAt")
+                    VALUES (gen_random_uuid(), %s, %s, %s, NOW())
+                """, (saved_review_id, media.get("url"), media.get("thumbnailUrl")))
+        
+        conn.commit()
+        return True
+        
+    except Exception as e:
+        conn.rollback()
+        raise Exception(f"Review save failed for {review_id}: {str(e)}")
+    finally:
+        cur.close()
+        conn.close()
+
+
+async def _run_async(config_id: str, seller_id: str) -> dict:
+    """
+    Ana scraping fonksiyonu
+    """
+    print(f"\n{'='*60}")
+    print(f"🚀 Yorum çekiliyor — Seller: {seller_id}")
+    print(f"{'='*60}\n")
+    
+    t_start = time.time()
+    
+    try:
+        # Cookie al
+        print("🍪 Cookie alınıyor...")
+        cookie_str = await get_cookies()
+        print(f"✅ Cookie alındı\n")
+        
+    except Exception as e:
+        error_msg = f"Cookie alma hatası: {str(e)}"
+        print(f"❌ {error_msg}")
+        raise Exception(error_msg)
+    
+    # Pagination ile tüm yorumları çek
+    all_reviews = []
+    page = 0
+    
+    try:
+        while True:
+            data = get_reviews_page(page, seller_id, cookie_str)
+            
+            if not data:
+                break
+            
+            product_reviews = data.get("productReviews", {})
+            reviews = product_reviews.get("content", [])
+            total_pages = product_reviews.get("totalPages", 0)
+            total_elements = product_reviews.get("totalElements", 0)
+            
+            if not reviews:
+                break
+            
+            filtered, filtered_out = filter_by_seller(reviews, seller_id)
+            all_reviews.extend(filtered)
+            
+            print(f"📄 Sayfa {page + 1}/{total_pages}: {len(filtered)} ✓ | {filtered_out} ✗ | Toplam: {len(all_reviews)}/{total_elements}")
+            
+            if page >= total_pages - 1:
+                break
+            
+            page += 1
+            time.sleep(0.3)
+        
+        print(f"\n✅ Toplam {len(all_reviews)} yorum çekildi\n")
+        
+    except Exception as e:
+        error_msg = f"API scraping hatası: {str(e)}"
+        print(f"❌ {error_msg}")
+        raise Exception(error_msg)
+    
+    # DB'ye kaydet
+    print("💾 DB'ye kaydediliyor...\n")
+    
+    saved_count = 0
+    skipped_count = 0
+    products_processed = set()
+    errors = []
+    
+    for review in all_reviews:
+        try:
+            product_id = save_or_update_product(config_id, review)
+            
+            if product_id:
+                products_processed.add(review.get("contentId"))
+                
+                if save_review(product_id, review):
+                    saved_count += 1
+                else:
+                    skipped_count += 1
+        except Exception as e:
+            errors.append(str(e))
+            if len(errors) <= 3:  # İlk 3 hatayı logla
+                print(f"⚠️ Kayıt hatası: {e}")
+    
+    t_elapsed = round(time.time() - t_start, 2)
+    
+    print(f"\n{'='*60}")
+    print(f"✅ TAMAMLANDI")
+    print(f"   Toplam yorum     : {len(all_reviews)}")
+    print(f"   Kaydedilen       : {saved_count}")
+    print(f"   Duplicate        : {skipped_count}")
+    print(f"   Unique ürün      : {len(products_processed)}")
+    print(f"   Süre             : {t_elapsed}s")
+    if errors:
+        print(f"   ⚠️ Hata sayısı   : {len(errors)}")
+    print(f"{'='*60}\n")
+    
+    return {
+        "total_saved": saved_count,
+        "total_skipped": skipped_count,
+        "unique_products": len(products_processed),
+        "elapsed": t_elapsed,
+        "errors": errors[:10] if errors else [],
+    }
+
+
+def _run_sync(config_id: str, seller_id: str) -> dict:
+    return asyncio.run(_run_async(config_id, seller_id))
+
+
+async def run(config_id: str, seller_id: str) -> dict:
+    """
+    Entry point - FastAPI/Queue Manager'dan çağrılır
     """
     loop = asyncio.get_event_loop()
     with concurrent.futures.ThreadPoolExecutor() as pool:
         result = await loop.run_in_executor(
             pool,
-            lambda: _run_sync(config_id, seller_id, content_ids)
+            lambda: _run_sync(config_id, seller_id)
         )
     return result
