@@ -95,11 +95,12 @@ def auto_publish_matched_reviews(config_id: str, newly_saved_review_ids: list) -
                 tr."userFullName",
                 tr."createdAt" as review_date,
                 tp."productName",
-                tp."storeId",
+                tc."storeId",
                 tp."ikasProductId",
                 tp.id as trendyol_product_id
             FROM "TrendyolReview" tr
             JOIN "TrendyolProduct" tp ON tp.id = tr."trendyolProductId"
+            JOIN "TrendyolConfig" tc ON tc.id = tp."configId"
             WHERE tr.id = ANY(%s)
             AND tp."ikasProductId" IS NOT NULL
             AND tr."importedAt" IS NULL
