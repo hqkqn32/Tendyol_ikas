@@ -1,5 +1,6 @@
 from db import get_connection
 from datetime import datetime
+import json
 
 
 def get_next_job():
@@ -16,6 +17,7 @@ def get_next_job():
                 sq.id,
                 sq."storeId" as store_id,
                 sq."configId" as config_id,
+                sq."scrapeType" as scrape_type,
                 tc."sellerId" as seller_id
             FROM "ScrapeQueue" sq
             JOIN "TrendyolConfig" tc ON tc.id = sq."configId"
@@ -55,7 +57,7 @@ def get_next_job():
         conn.close()
 
 
-def mark_job_completed(queue_id: str):
+def mark_job_completed(queue_id: str, runtime_log: dict = None):
     """
     İşi completed olarak işaretle
     """
@@ -68,9 +70,10 @@ def mark_job_completed(queue_id: str):
             SET 
                 status = 'done',
                 "finishedAt" = NOW(),
+                "runTimeLog" = %s,
                 "updatedAt" = NOW()
             WHERE id = %s
-        """, (queue_id,))
+        """, (json.dumps(runtime_log) if runtime_log else None, queue_id))
         
         conn.commit()
         

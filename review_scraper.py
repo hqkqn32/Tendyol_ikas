@@ -70,6 +70,152 @@ def filter_by_seller(reviews: list, seller_id: str) -> tuple:
     return filtered, filtered_out
 
 
+def auto_publish_matched_reviews(config_id: str, newly_saved_review_ids: list) -> dict:
+    """
+    SADECE bu scraping'de eklenen ve eşleşmiş ürünlerin yorumlarını otomatik yayınla
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    
+    try:
+        if not newly_saved_review_ids:
+            return {
+                "matchedProducts": 0,
+                "publishedReviews": 0,
+                "skippedUnmatched": 0
+            }
+        
+        # SADECE yeni eklenen yorumları al
+        cur.execute("""
+            SELECT 
+                tr.id,
+                tr."trendyolId",
+                tr.rate,
+                tr.comment,
+                tr."userFullName",
+                tr."createdAt" as review_date,
+                tp."productName",
+                tp."storeId",
+                tp."ikasProductId",
+                tp.id as trendyol_product_id
+            FROM "TrendyolReview" tr
+            JOIN "TrendyolProduct" tp ON tp.id = tr."trendyolProductId"
+            WHERE tr.id = ANY(%s)
+            AND tp."ikasProductId" IS NOT NULL
+            AND tr."importedAt" IS NULL
+        """, (newly_saved_review_ids,))
+        
+        reviews_to_publish = cur.fetchall()
+        
+        if not reviews_to_publish:
+            # Yeni yorumlar var ama eşleşmemiş
+            cur.execute("""
+                SELECT COUNT(*) as total
+                FROM "TrendyolReview" tr
+                JOIN "TrendyolProduct" tp ON tp.id = tr."trendyolProductId"
+                WHERE tr.id = ANY(%s)
+                AND tp."ikasProductId" IS NULL
+            """, (newly_saved_review_ids,))
+            
+            unmatched_count = cur.fetchone()["total"]
+            
+            return {
+                "matchedProducts": 0,
+                "publishedReviews": 0,
+                "skippedUnmatched": unmatched_count
+            }
+        
+        published_count = 0
+        matched_product_ids = set()
+        
+        for review in reviews_to_publish:
+            matched_product_ids.add(review["trendyol_product_id"])
+            
+            # Görselleri al
+            cur.execute("""
+                SELECT url
+                FROM "TrendyolReviewMedia"
+                WHERE "reviewId" = %s
+                ORDER BY "createdAt"
+            """, (review["id"],))
+            
+            media_rows = cur.fetchall()
+            media_urls = [row["url"] for row in media_rows] if media_rows else None
+            
+            # Review tablosuna ekle
+            try:
+                cur.execute("""
+                    INSERT INTO "Review" (
+                        id,
+                        "storeId",
+                        "productId",
+                        "productName",
+                        rating,
+                        comment,
+                        "reviewerName",
+                        "reviewDate",
+                        status,
+                        "trendyolReviewId",
+                        "mediaUrls",
+                        "createdAt",
+                        "updatedAt"
+                    )
+                    VALUES (
+                        gen_random_uuid(),
+                        %s, %s, %s, %s, %s, %s, %s, 'approved', %s, %s, NOW(), NOW()
+                    )
+                    ON CONFLICT ("trendyolReviewId") DO NOTHING
+                """, (
+                    review["storeId"],
+                    review["ikasProductId"],
+                    review["productName"],
+                    review["rate"],
+                    review["comment"],
+                    review["userFullName"],
+                    review["review_date"],
+                    str(review["trendyolId"]),
+                    media_urls
+                ))
+                
+                # ImportedAt güncelle
+                cur.execute("""
+                    UPDATE "TrendyolReview"
+                    SET "importedAt" = NOW()
+                    WHERE id = %s
+                """, (review["id"],))
+                
+                published_count += 1
+                
+            except Exception as e:
+                continue
+        
+        conn.commit()
+        
+        # Bu scraping'deki eşleşmemiş yorumlar
+        cur.execute("""
+            SELECT COUNT(*) as total
+            FROM "TrendyolReview" tr
+            JOIN "TrendyolProduct" tp ON tp.id = tr."trendyolProductId"
+            WHERE tr.id = ANY(%s)
+            AND tp."ikasProductId" IS NULL
+        """, (newly_saved_review_ids,))
+        
+        unmatched_count = cur.fetchone()["total"]
+        
+        return {
+            "matchedProducts": len(matched_product_ids),
+            "publishedReviews": published_count,
+            "skippedUnmatched": unmatched_count
+        }
+        
+    except Exception as e:
+        conn.rollback()
+        raise Exception(f"Auto-publish failed: {str(e)}")
+    finally:
+        cur.close()
+        conn.close()
+
+
 def save_or_update_product(config_id: str, review: dict) -> str:
     """
     Ürünü DB'ye kaydet veya güncelle
@@ -133,13 +279,14 @@ def save_or_update_product(config_id: str, review: dict) -> str:
         conn.close()
 
 
-def save_review(trendyol_product_id: str, review: dict) -> bool:
+def save_review(trendyol_product_id: str, review: dict) -> str:
     """
     Yorumu ve görsellerini DB'ye kaydet
+    Returns: Kaydedilen review ID veya None
     """
     review_id = review.get("id")
     if not review_id or not trendyol_product_id:
-        return False
+        return None
     
     conn = get_connection()
     cur = conn.cursor()
@@ -166,7 +313,7 @@ def save_review(trendyol_product_id: str, review: dict) -> bool:
         result = cur.fetchone()
         if not result:
             conn.rollback()
-            return False
+            return None
         
         saved_review_id = result["id"]
         
@@ -180,7 +327,7 @@ def save_review(trendyol_product_id: str, review: dict) -> bool:
                 """, (saved_review_id, media.get("url"), media.get("thumbnailUrl")))
         
         conn.commit()
-        return True
+        return saved_review_id
         
     except Exception as e:
         conn.rollback()
@@ -190,15 +337,16 @@ def save_review(trendyol_product_id: str, review: dict) -> bool:
         conn.close()
 
 
-async def _run_async(config_id: str, seller_id: str) -> dict:
+async def _run_async(config_id: str, seller_id: str, scrape_type: str = "update") -> dict:
     """
     Ana scraping fonksiyonu
     """
     print(f"\n{'='*60}")
-    print(f"🚀 Yorum çekiliyor — Seller: {seller_id}")
+    print(f"🚀 Yorum çekiliyor — Seller: {seller_id} — Type: {scrape_type.upper()}")
     print(f"{'='*60}\n")
     
     t_start = time.time()
+    start_time = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     
     try:
         # Cookie al
@@ -255,6 +403,7 @@ async def _run_async(config_id: str, seller_id: str) -> dict:
     skipped_count = 0
     products_processed = set()
     errors = []
+    newly_saved_review_ids = []
     
     for review in all_reviews:
         try:
@@ -263,16 +412,28 @@ async def _run_async(config_id: str, seller_id: str) -> dict:
             if product_id:
                 products_processed.add(review.get("contentId"))
                 
-                if save_review(product_id, review):
+                saved_review_id = save_review(product_id, review)
+                if saved_review_id:
                     saved_count += 1
+                    newly_saved_review_ids.append(saved_review_id)
                 else:
                     skipped_count += 1
         except Exception as e:
             errors.append(str(e))
-            if len(errors) <= 3:  # İlk 3 hatayı logla
+            if len(errors) <= 3:
                 print(f"⚠️ Kayıt hatası: {e}")
     
+    # AUTO-PUBLISH: SADECE yeni eklenen ve eşleşmiş yorumları yayınla
+    print("🚀 Auto-publish kontrol ediliyor...\n")
+    publish_result = auto_publish_matched_reviews(config_id, newly_saved_review_ids)
+    
+    print(f"📢 Auto-publish sonucu:")
+    print(f"   Eşleşmiş ürünler     : {publish_result['matchedProducts']}")
+    print(f"   Yayınlanan yorumlar  : {publish_result['publishedReviews']}")
+    print(f"   Bekleyen (eşleşmemiş): {publish_result['skippedUnmatched']}\n")
+    
     t_elapsed = round(time.time() - t_start, 2)
+    end_time = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     
     print(f"\n{'='*60}")
     print(f"✅ TAMAMLANDI")
@@ -285,20 +446,37 @@ async def _run_async(config_id: str, seller_id: str) -> dict:
         print(f"   ⚠️ Hata sayısı   : {len(errors)}")
     print(f"{'='*60}\n")
     
+    # runTimeLog
+    runtime_log = {
+        "scrapeType": scrape_type,
+        "startTime": start_time,
+        "endTime": end_time,
+        "duration": t_elapsed,
+        "scrapedData": {
+            "totalScraped": len(all_reviews),
+            "newReviews": saved_count,
+            "duplicateReviews": skipped_count,
+            "uniqueProducts": len(products_processed)
+        },
+        "autoPublished": publish_result,
+        "errors": errors[:10] if errors else []
+    }
+    
     return {
         "total_saved": saved_count,
         "total_skipped": skipped_count,
         "unique_products": len(products_processed),
         "elapsed": t_elapsed,
         "errors": errors[:10] if errors else [],
+        "runtime_log": runtime_log
     }
 
 
-def _run_sync(config_id: str, seller_id: str) -> dict:
-    return asyncio.run(_run_async(config_id, seller_id))
+def _run_sync(config_id: str, seller_id: str, scrape_type: str = "update") -> dict:
+    return asyncio.run(_run_async(config_id, seller_id, scrape_type))
 
 
-async def run(config_id: str, seller_id: str) -> dict:
+async def run(config_id: str, seller_id: str, scrape_type: str = "update") -> dict:
     """
     Entry point - FastAPI/Queue Manager'dan çağrılır
     """
@@ -306,6 +484,6 @@ async def run(config_id: str, seller_id: str) -> dict:
     with concurrent.futures.ThreadPoolExecutor() as pool:
         result = await loop.run_in_executor(
             pool,
-            lambda: _run_sync(config_id, seller_id)
+            lambda: _run_sync(config_id, seller_id, scrape_type)
         )
     return result

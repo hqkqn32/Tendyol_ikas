@@ -64,12 +64,14 @@ async def worker_loop():
             config_id = job["config_id"]
             seller_id = job["seller_id"]
             store_id = job["store_id"]
+            scrape_type = job.get("scrape_type", "update")  # ← YENİ
             
             job_info = {
                 "queue_id": queue_id,
                 "config_id": config_id,
                 "seller_id": seller_id,
                 "store_id": store_id,
+                "scrape_type": scrape_type,  # ← YENİ
             }
             
             cpu = psutil.cpu_percent(interval=0)
@@ -78,17 +80,27 @@ async def worker_loop():
             mem_total_mb = round(mem.total / 1024 / 1024)
             
             print(f"[{time.strftime('%H:%M:%S')}] [CPU:{cpu}% MEM:{mem_mb}MB/{mem_total_mb}MB] 🚀 İş başladı — queue_id: {queue_id}")
-            print(f"[{time.strftime('%H:%M:%S')}]    store_id: {store_id} | seller_id: {seller_id}")
+            print(f"[{time.strftime('%H:%M:%S')}]    store_id: {store_id} | seller_id: {seller_id} | type: {scrape_type}")  # ← GÜNCELLE
             
             try:
                 # Scraping yap
-                result = await review_scraper.run(config_id, seller_id)
+                result = await review_scraper.run(config_id, seller_id, scrape_type)  # ← GÜNCELLE
+                
+                # runTimeLog'u al
+                runtime_log = result.get('runtime_log')  # ← YENİ
                 
                 # Başarılı
-                mark_job_completed(queue_id)
+                mark_job_completed(queue_id, runtime_log)  # ← GÜNCELLE
                 consecutive_errors = 0
                 
                 print(f"[{time.strftime('%H:%M:%S')}] ✅ İş tamamlandı — {result.get('total_saved')} yorum kaydedildi")
+                
+                # runTimeLog detayları
+                if runtime_log:  # ← YENİ
+                    scraped = runtime_log.get('scrapedData', {})
+                    auto_pub = runtime_log.get('autoPublished', {})
+                    print(f"[{time.strftime('%H:%M:%S')}]    📊 Çekilen: {scraped.get('totalScraped')} | Yeni: {scraped.get('newReviews')} | Duplicate: {scraped.get('duplicateReviews')}")
+                    print(f"[{time.strftime('%H:%M:%S')}]    🚀 Auto-publish: {auto_pub.get('publishedReviews')} yayınlandı | {auto_pub.get('skippedUnmatched')} beklemede")
                 
                 # Başarı bildirimi (sadece önemli işler için)
                 if result.get('total_saved', 0) > 50:
