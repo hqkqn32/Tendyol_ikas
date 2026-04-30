@@ -71,21 +71,13 @@ def filter_by_seller(reviews: list, seller_id: str) -> tuple:
 
 
 def auto_publish_matched_reviews(config_id: str, newly_saved_review_ids: list) -> dict:
-    """
-    SADECE bu scraping'de eklenen ve eşleşmiş ürünlerin yorumlarını otomatik yayınla
-    """
     conn = get_connection()
     cur = conn.cursor()
     
     try:
         if not newly_saved_review_ids:
-            return {
-                "matchedProducts": 0,
-                "publishedReviews": 0,
-                "skippedUnmatched": 0
-            }
+            return {"matchedProducts": 0, "publishedReviews": 0, "skippedUnmatched": 0}
         
-        # SADECE yeni eklenen yorumları al
         cur.execute("""
             SELECT 
                 tr.id,
@@ -96,11 +88,13 @@ def auto_publish_matched_reviews(config_id: str, newly_saved_review_ids: list) -
                 tr."createdAt" as review_date,
                 tp."productName",
                 tc."storeId",
-                tp."ikasProductId",
+                ip."productId" as ikas_product_id,
+                ip.slug as product_slug,
                 tp.id as trendyol_product_id
             FROM "TrendyolReview" tr
             JOIN "TrendyolProduct" tp ON tp.id = tr."trendyolProductId"
             JOIN "TrendyolConfig" tc ON tc.id = tp."configId"
+            JOIN "IkasProduct" ip ON ip.id = tp."ikasProductId"
             WHERE tr.id = ANY(%s)
             AND tp."ikasProductId" IS NOT NULL
             AND tr."importedAt" IS NULL
@@ -109,7 +103,6 @@ def auto_publish_matched_reviews(config_id: str, newly_saved_review_ids: list) -
         reviews_to_publish = cur.fetchall()
         
         if not reviews_to_publish:
-            # Yeni yorumlar var ama eşleşmemiş
             cur.execute("""
                 SELECT COUNT(*) as total
                 FROM "TrendyolReview" tr
@@ -117,82 +110,85 @@ def auto_publish_matched_reviews(config_id: str, newly_saved_review_ids: list) -
                 WHERE tr.id = ANY(%s)
                 AND tp."ikasProductId" IS NULL
             """, (newly_saved_review_ids,))
-            
             unmatched_count = cur.fetchone()["total"]
-            
-            return {
-                "matchedProducts": 0,
-                "publishedReviews": 0,
-                "skippedUnmatched": unmatched_count
-            }
+            return {"matchedProducts": 0, "publishedReviews": 0, "skippedUnmatched": unmatched_count}
         
         published_count = 0
         matched_product_ids = set()
         
         for review in reviews_to_publish:
-            matched_product_ids.add(review["trendyol_product_id"])
-            
-            # Görselleri al
-            cur.execute("""
-                SELECT url
-                FROM "TrendyolReviewMedia"
-                WHERE "reviewId" = %s
-                ORDER BY "createdAt"
-            """, (review["id"],))
-            
-            media_rows = cur.fetchall()
-            media_urls = [row["url"] for row in media_rows] if media_rows else None
-            
-            # Review tablosuna ekle
             try:
+                cur.execute("SAVEPOINT review_save")
+                
                 cur.execute("""
                     INSERT INTO "Review" (
                         id,
                         "storeId",
                         "productId",
                         "productName",
+                        "productSlug",
+                        "customerName",
                         rating,
-                        comment,
-                        "reviewerName",
-                        "reviewDate",
+                        body,
                         status,
-                        "trendyolReviewId",
+                        source,
+                        "isVerified",
                         "mediaUrls",
+                        "trendyolReviewId",
                         "createdAt",
                         "updatedAt"
                     )
                     VALUES (
                         gen_random_uuid(),
-                        %s, %s, %s, %s, %s, %s, %s, 'approved', %s, %s, NOW(), NOW()
+                        %s, %s, %s, %s, %s, %s, %s,
+                        'approved', 'trendyol', %s, %s, %s, %s, NOW()
                     )
-                    ON CONFLICT ("trendyolReviewId") DO NOTHING
+                    ON CONFLICT DO NOTHING
                 """, (
                     review["storeId"],
-                    review["ikasProductId"],
+                    review["ikas_product_id"],
                     review["productName"],
+                    review["product_slug"],
+                    review["userFullName"] or 'Trendyol Müşterisi',
                     review["rate"],
                     review["comment"],
-                    review["userFullName"],
+                    True,
+                    [],
+                    review["id"],
                     review["review_date"],
-                    str(review["trendyolId"]),
-                    media_urls
                 ))
                 
-                # ImportedAt güncelle
+                # Görselleri al ve mediaUrls güncelle
+                cur.execute("""
+                    SELECT url FROM "TrendyolReviewMedia"
+                    WHERE "reviewId" = %s
+                """, (review["id"],))
+                media_rows = cur.fetchall()
+                media_urls = [row["url"] for row in media_rows] if media_rows else []
+                
+                if media_urls:
+                    cur.execute("""
+                        UPDATE "Review" SET "mediaUrls" = %s
+                        WHERE "trendyolReviewId" = %s
+                    """, (media_urls, review["id"]))
+                
                 cur.execute("""
                     UPDATE "TrendyolReview"
                     SET "importedAt" = NOW()
                     WHERE id = %s
                 """, (review["id"],))
                 
+                cur.execute("RELEASE SAVEPOINT review_save")
+                matched_product_ids.add(review["trendyol_product_id"])
                 published_count += 1
                 
             except Exception as e:
+                cur.execute("ROLLBACK TO SAVEPOINT review_save")
+                print(f"⚠️ Yorum atlandı ({review['trendyolId']}): {e}")
                 continue
         
         conn.commit()
         
-        # Bu scraping'deki eşleşmemiş yorumlar
         cur.execute("""
             SELECT COUNT(*) as total
             FROM "TrendyolReview" tr
@@ -200,7 +196,6 @@ def auto_publish_matched_reviews(config_id: str, newly_saved_review_ids: list) -
             WHERE tr.id = ANY(%s)
             AND tp."ikasProductId" IS NULL
         """, (newly_saved_review_ids,))
-        
         unmatched_count = cur.fetchone()["total"]
         
         return {
