@@ -238,20 +238,61 @@ async def worker_loop():
 
             await asyncio.sleep(10)
 
-
 @app.get("/health")
 async def health():
+    """
+    Healthcheck - Worker gerçekten çalışıyor mu?
+    """
     cpu = psutil.cpu_percent(interval=1)
     mem = psutil.virtual_memory()
-
-    return {
-        "status": "ok" if worker_running else "stopped",
-        "worker_running": worker_running,
-        "cpu_percent": cpu,
-        "memory_percent": mem.percent,
-        "memory_used_mb": round(mem.used / 1024 / 1024),
-        "memory_total_mb": round(mem.total / 1024 / 1024),
-    }
+    
+    # Son 10 dakikada job activity var mı?
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        
+        # Son 10 dakikadaki aktivite
+        cur.execute("""
+            SELECT COUNT(*) as count
+            FROM "ScrapeQueue"
+            WHERE "updatedAt" > NOW() - INTERVAL '10 minutes'
+        """)
+        recent_activity = cur.fetchone()["count"]
+        
+        # Zamanı gelmiş pending job'lar
+        cur.execute("""
+            SELECT COUNT(*) as count
+            FROM "ScrapeQueue"
+            WHERE status = 'pending'
+              AND "scheduledAt" <= NOW()
+        """)
+        pending_ready = cur.fetchone()["pending_count"]
+        
+        cur.close()
+        conn.close()
+        
+        # Worker çalışıyor + (son 10dk aktivite var VEYA bekleyen job yok) = SAĞLIKLI
+        is_healthy = worker_running and (recent_activity > 0 or pending_ready == 0)
+        
+        return {
+            "status": "healthy" if is_healthy else "unhealthy",
+            "worker_running": worker_running,
+            "recent_activity": recent_activity,
+            "pending_ready_jobs": pending_ready,
+            "cpu_percent": cpu,
+            "memory_percent": mem.percent,
+            "memory_used_mb": round(mem.used / 1024 / 1024),
+            "memory_total_mb": round(mem.total / 1024 / 1024),
+        }
+        
+    except Exception as e:
+        return {
+            "status": "error",
+            "worker_running": worker_running,
+            "error": str(e),
+            "cpu_percent": cpu,
+            "memory_percent": mem.percent,
+        }
 
 
 @app.get("/")
