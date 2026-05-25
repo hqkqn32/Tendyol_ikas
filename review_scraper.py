@@ -141,7 +141,7 @@ def auto_publish_matched_reviews(config_id: str, newly_saved_review_ids: list) -
                     VALUES (
                         gen_random_uuid(),
                         %s, %s, %s, %s, %s, %s, %s,
-                        'approved', 'trendyol', %s, %s, %s, %s, NOW()
+                        'approved', 'trendyol', %s, %s, %s, to_timestamp(%s / 1000.0), NOW()
                     )
                     ON CONFLICT DO NOTHING
                 """, (
