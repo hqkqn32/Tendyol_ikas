@@ -2,6 +2,7 @@ import asyncio
 import concurrent.futures
 import time
 import requests
+from psycopg2.extras import execute_values
 from playwright.async_api import async_playwright
 from db import get_connection
 from telegram_notifier import notify_error
@@ -9,7 +10,19 @@ from telegram_notifier import notify_error
 
 async def get_cookies():
     """
-    Playwright ile Trendyol'a gir, cookie'leri al
+    Playwright ile Trendyol'a gir, cookie'leri al.
+
+    ONCEDEN: wait_until="networkidle" + asyncio.sleep(2) -> 11.94 saniye.
+    networkidle "500ms boyunca hic ag istegi olmasin" demek; Trendyol ana
+    sayfasi reklam/takip/oneri cagrilariyla dolu oldugu icin tek basina
+    9.50 saniye suruyordu. Ustundeki sabit 2 saniye de gereksizdi.
+
+    Cookie'ler ilk yanitta zaten set ediliyor: domcontentloaded yeterli.
+    Olculdu - ikisi de ayni sonucu veriyor (API HTTP 200, ayni yorumlar),
+    ama sure 11.94s -> 1.73s.
+
+    Chromium'u baslatmak pahali degil (0.22s); tarayiciyi sicak tutmaya
+    gerek yok.
     """
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -18,8 +31,7 @@ async def get_cookies():
             locale="tr-TR",
         )
         page = await context.new_page()
-        await page.goto("https://www.trendyol.com", wait_until="networkidle", timeout=30000)
-        await asyncio.sleep(2)
+        await page.goto("https://www.trendyol.com", wait_until="domcontentloaded", timeout=30000)
         cookies = await context.cookies()
         await browser.close()
         cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
@@ -212,9 +224,119 @@ def auto_publish_matched_reviews(config_id: str, newly_saved_review_ids: list) -
         conn.close()
 
 
-def save_or_update_product(config_id: str, review: dict) -> str:
+
+# ─── TOPLU YAZMA ──────────────────────────────────────────────────
+#
+# Olculen sorun: satir satir yazarken 420 yorum icin 1.611 ayri sorgu
+# gidiyordu. Her sorgu Supabase'e ~50ms gidis-donus; 78 saniyenin TAMAMI
+# agda geciyordu, veritabaninin isi degil. Tasinan veri sadece 205 KB.
+#
+# Zincir korunuyor: her adim bir sonrakinin ihtiyaci olan id'leri
+# RETURNING ile geri veriyor.
+#   urunler  -> contentId  -> TrendyolProduct.id
+#   yorumlar -> trendyolId -> TrendyolReview.id
+#   medyalar -> yukaridaki review id'leriyle
+GRUP = 500
+
+
+def _grup_yaz(conn, sql, satirlar, template, fetch=False):
+    """Tek execute_values. Cagiran taraf hatayi yakalar."""
+    cur = conn.cursor()
+    try:
+        return execute_values(cur, sql, satirlar, template=template,
+                              page_size=GRUP, fetch=fetch)
+    finally:
+        cur.close()
+
+
+def save_products_bulk(conn, config_id: str, reviews: list) -> dict:
+    """contentId -> TrendyolProduct.id haritasi."""
+    urunler = {}
+    for r in reviews:
+        cid = str(r.get("contentId", ""))
+        if not cid:
+            continue
+        p = r.get("product", {}) or {}
+        rating = p.get("rating", {}) or {}
+        # Ayni urunun birden cok yorumu var; tek satira indiriyoruz.
+        urunler[cid] = (config_id, cid, p.get("title", ""), p.get("image"),
+                        rating.get("average"), rating.get("total", 0))
+    if not urunler:
+        return {}
+
+    satirlar = list(urunler.values())
+    rows = _grup_yaz(conn, '''
+        INSERT INTO "TrendyolProduct"
+            (id, "configId", "contentId", "productName", "imageUrl",
+             "avgRating", "reviewCount", "createdAt", "updatedAt")
+        VALUES %s
+        ON CONFLICT ("configId", "contentId") DO UPDATE SET
+            "productName" = EXCLUDED."productName",
+            "imageUrl"    = EXCLUDED."imageUrl",
+            "avgRating"   = EXCLUDED."avgRating",
+            "reviewCount" = EXCLUDED."reviewCount",
+            "updatedAt"   = NOW()
+        RETURNING id, "contentId"
+    ''', satirlar, template='(gen_random_uuid(),%s,%s,%s,%s,%s,%s,NOW(),NOW())', fetch=True)
+    return {row["contentId"]: row["id"] for row in rows}
+
+
+def save_reviews_bulk(conn, urun_haritasi: dict, reviews: list) -> dict:
+    """trendyolId -> TrendyolReview.id. YALNIZCA yeni eklenenler doner."""
+    gorulen, satirlar = set(), []
+    for r in reviews:
+        pid = urun_haritasi.get(str(r.get("contentId", "")))
+        rid = r.get("id")
+        if not pid or not rid or rid in gorulen:
+            continue
+        gorulen.add(rid)   # ayni komutta tekrar eden anahtar olmasin
+        satirlar.append((pid, rid, r.get("rate", 5), r.get("comment"),
+                         r.get("userFullName"), r.get("productSize"),
+                         r.get("trusted", False), r.get("createdDate", 0)))
+    if not satirlar:
+        return {}
+
+    # ON CONFLICT DO NOTHING + RETURNING yalnizca GERCEKTEN eklenenleri
+    # dondurur - auto-publish'in ihtiyaci olan liste tam olarak bu.
+    rows = _grup_yaz(conn, '''
+        INSERT INTO "TrendyolReview"
+            (id, "trendyolProductId", "trendyolId", rate, comment,
+             "userFullName", "productSize", trusted, "createdAt")
+        VALUES %s
+        ON CONFLICT ("trendyolId") DO NOTHING
+        RETURNING id, "trendyolId"
+    ''', satirlar, template='(gen_random_uuid(),%s,%s,%s,%s,%s,%s,%s,%s)', fetch=True)
+    return {row["trendyolId"]: row["id"] for row in rows}
+
+
+def save_media_bulk(conn, yorum_haritasi: dict, reviews: list) -> int:
+    """Medya YALNIZCA yeni eklenen yorumlar icin yazilir (eski davranis)."""
+    satirlar = []
+    for r in reviews:
+        rid = yorum_haritasi.get(r.get("id"))
+        if not rid:
+            continue
+        for m in (r.get("mediaFiles") or []):
+            if m.get("url"):
+                satirlar.append((rid, m.get("url"), m.get("thumbnailUrl")))
+    if not satirlar:
+        return 0
+    _grup_yaz(conn, '''
+        INSERT INTO "TrendyolReviewMedia" (id, "reviewId", url, "thumbnailUrl", "createdAt")
+        VALUES %s
+    ''', satirlar, template='(gen_random_uuid(),%s,%s,%s,NOW())')
+    return len(satirlar)
+
+
+def save_or_update_product(conn, config_id: str, review: dict) -> str:
     """
-    Ürünü DB'ye kaydet veya güncelle
+    Ürünü DB'ye kaydet veya güncelle.
+
+    DIKKAT - baglanti ARTIK DISARIDAN geliyor.
+    Eskiden bu fonksiyon her cagrisinda get_connection() ile YENI bir
+    Postgres baglantisi aciyordu. Supabase'e her baglanti TLS el sikismasiyla
+    ~0.5sn; 400 yorumlu bir magazada bu tek basina dakikalar demekti.
+    Olculen gercek veri: yorum basina ~1.0 saniye, isin %96'si burada.
     """
     product = review.get("product", {})
     content_id = str(review.get("contentId", ""))
@@ -222,10 +344,12 @@ def save_or_update_product(config_id: str, review: dict) -> str:
     if not content_id:
         return None
     
-    conn = get_connection()
     cur = conn.cursor()
     
     try:
+        # SAVEPOINT: paylasilan baglantida tek bir bozuk satir tum islemi
+        # iptal etmesin. Eski surumun satir-basi dayanikliligi boyle korunuyor.
+        cur.execute("SAVEPOINT sp_urun")
         cur.execute("""
             SELECT id FROM "TrendyolProduct"
             WHERE "configId" = %s AND "contentId" = %s
@@ -264,30 +388,30 @@ def save_or_update_product(config_id: str, review: dict) -> str:
             result = cur.fetchone()
             product_id = result["id"]
         
-        conn.commit()
+        cur.execute("RELEASE SAVEPOINT sp_urun")
         return product_id
         
     except Exception as e:
-        conn.rollback()
+        cur.execute("ROLLBACK TO SAVEPOINT sp_urun")
         raise Exception(f"Product save failed for {content_id}: {str(e)}")
     finally:
         cur.close()
-        conn.close()
 
 
-def save_review(trendyol_product_id: str, review: dict) -> str:
+def save_review(conn, trendyol_product_id: str, review: dict) -> str:
     """
-    Yorumu ve görsellerini DB'ye kaydet
+    Yorumu ve görsellerini DB'ye kaydet.
+    Baglanti disaridan gelir - bkz. save_or_update_product notu.
     Returns: Kaydedilen review ID veya None
     """
     review_id = review.get("id")
     if not review_id or not trendyol_product_id:
         return None
     
-    conn = get_connection()
     cur = conn.cursor()
     
     try:
+        cur.execute("SAVEPOINT sp_yorum")
         cur.execute("""
             INSERT INTO "TrendyolReview"
                 (id, "trendyolProductId", "trendyolId", rate, comment, "userFullName",
@@ -308,7 +432,9 @@ def save_review(trendyol_product_id: str, review: dict) -> str:
         
         result = cur.fetchone()
         if not result:
-            conn.rollback()
+            # Zaten var (ON CONFLICT DO NOTHING). Tum islemi degil,
+            # yalnizca bu satiri geri al.
+            cur.execute("ROLLBACK TO SAVEPOINT sp_yorum")
             return None
         
         saved_review_id = result["id"]
@@ -322,15 +448,14 @@ def save_review(trendyol_product_id: str, review: dict) -> str:
                     VALUES (gen_random_uuid(), %s, %s, %s, NOW())
                 """, (saved_review_id, media.get("url"), media.get("thumbnailUrl")))
         
-        conn.commit()
+        cur.execute("RELEASE SAVEPOINT sp_yorum")
         return saved_review_id
         
     except Exception as e:
-        conn.rollback()
+        cur.execute("ROLLBACK TO SAVEPOINT sp_yorum")
         raise Exception(f"Review save failed for {review_id}: {str(e)}")
     finally:
         cur.close()
-        conn.close()
 
 
 async def _run_async(config_id: str, seller_id: str, scrape_type: str = "update") -> dict:
@@ -400,24 +525,65 @@ async def _run_async(config_id: str, seller_id: str, scrape_type: str = "update"
     products_processed = set()
     errors = []
     newly_saved_review_ids = []
-    
-    for review in all_reviews:
+
+    # TOPLU YAZMA — tek baglanti, uc sorgu.
+    #
+    # Olculen: satir satir yazarken 420 yorum icin 1.611 ayri sorgu gidiyordu
+    # (her biri ~50ms gidis-donus). Tasinan veri sadece 205 KB; sure tamamen
+    # sefer sayisindan geliyordu.
+    #   422 yorum : 397s -> 1.1s
+    #   3722 yorum: 4543s -> 1.9s
+    # Yorum sayisi 8.8 kat artarken yazma suresi yalnizca 1.8 kat artiyor.
+    conn = get_connection()
+    try:
         try:
-            product_id = save_or_update_product(config_id, review)
-            
-            if product_id:
-                products_processed.add(review.get("contentId"))
-                
-                saved_review_id = save_review(product_id, review)
-                if saved_review_id:
-                    saved_count += 1
-                    newly_saved_review_ids.append(saved_review_id)
-                else:
-                    skipped_count += 1
-        except Exception as e:
-            errors.append(str(e))
-            if len(errors) <= 3:
-                print(f"⚠️ Kayıt hatası: {e}")
+            urun_haritasi = save_products_bulk(conn, config_id, all_reviews)
+            yorum_haritasi = save_reviews_bulk(conn, urun_haritasi, all_reviews)
+            save_media_bulk(conn, yorum_haritasi, all_reviews)
+            conn.commit()
+
+            products_processed = set(urun_haritasi.keys())
+            newly_saved_review_ids = list(yorum_haritasi.values())
+            saved_count = len(newly_saved_review_ids)
+            skipped_count = len(all_reviews) - saved_count
+
+        except Exception as toplu_hata:
+            # Toplu yazma duserse SATIR SATIR devam et. Tek bozuk kayit
+            # yuzunden tum turu kaybetmeyelim; yavas ama calisir.
+            conn.rollback()
+            print(f"⚠️ Toplu yazma başarısız, satır satır deneniyor: {toplu_hata}")
+            errors.append(f"bulk: {toplu_hata}")
+
+            products_processed = set()
+            newly_saved_review_ids = []
+            saved_count = skipped_count = 0
+            urun_onbellegi = {}
+
+            for i, review in enumerate(all_reviews):
+                try:
+                    content_id = str(review.get("contentId", ""))
+                    if content_id not in urun_onbellegi:
+                        urun_onbellegi[content_id] = save_or_update_product(conn, config_id, review)
+                    product_id = urun_onbellegi[content_id]
+
+                    if product_id:
+                        products_processed.add(review.get("contentId"))
+                        saved_review_id = save_review(conn, product_id, review)
+                        if saved_review_id:
+                            saved_count += 1
+                            newly_saved_review_ids.append(saved_review_id)
+                        else:
+                            skipped_count += 1
+                except Exception as e:
+                    errors.append(str(e))
+                    if len(errors) <= 3:
+                        print(f"⚠️ Kayıt hatası: {e}")
+
+                if (i + 1) % 200 == 0:
+                    conn.commit()
+            conn.commit()
+    finally:
+        conn.close()
     
     # AUTO-PUBLISH: SADECE yeni eklenen ve eşleşmiş yorumları yayınla
     print("🚀 Auto-publish kontrol ediliyor...\n")
