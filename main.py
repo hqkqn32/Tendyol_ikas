@@ -1,9 +1,10 @@
 import asyncio
 import nest_asyncio
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from contextlib import asynccontextmanager
 import uvicorn
 import psutil
+import os
 import time
 import traceback
 from datetime import datetime
@@ -15,6 +16,18 @@ from db import get_connection
 nest_asyncio.apply()
 
 worker_running = False
+
+# Kuyruk bosken worker bu olayi bekler. /wake cagrisi olayi tetikleyince
+# 30 saniyelik yoklamayi beklemeden hemen kuyruga bakar.
+#
+# Neden gerekli: merchant formu gonderdigi anda is kuyruga giriyor ama
+# worker onu ortalama 15 saniye sonra fark ediyordu. Cekme+yazma toplam
+# 6-36 saniyeye indikten sonra bu bekleme, surenin en buyuk kalemi oldu.
+uyandirma_olayi: asyncio.Event | None = None
+
+# /wake icin paylasilan anahtar. Tanimli degilse endpoint kapali kalir -
+# acik birakmak, herkesin worker'i durtebilmesi demek olurdu.
+WAKE_SECRET = os.getenv("WAKE_SECRET")
 
 # Gecelik turda magazalar arasi bosluk. Hiz icin degil, Trendyol'a
 # kesintisiz yuklenmemek icin. 39 magaza -> ~3.2 saate yayilir.
@@ -174,8 +187,10 @@ async def cron_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global worker_running
+    global worker_running, uyandirma_olayi
     worker_running = True
+    # Olay, calisan event loop'a bagli olmali; modul duzeyinde kurulamaz.
+    uyandirma_olayi = asyncio.Event()
 
     notify_service_start()
 
@@ -214,8 +229,15 @@ async def worker_loop():
                 mem = psutil.virtual_memory()
                 mem_mb = round(mem.used / 1024 / 1024)
 
-                print(f"⏳ Kuyruk boş, 30s bekleniyor... [CPU:{cpu}% MEM:{mem_mb}MB]")
-                await asyncio.sleep(30)
+                print(f"⏳ Kuyruk boş, bekleniyor... [CPU:{cpu}% MEM:{mem_mb}MB]")
+                # Duz sleep(30) yerine olay bekliyoruz: /wake gelirse
+                # hemen uyanir, gelmezse 30 saniyede bir yine yoklar.
+                try:
+                    await asyncio.wait_for(uyandirma_olayi.wait(), timeout=30)
+                    uyandirma_olayi.clear()
+                    print(f"[{time.strftime('%H:%M:%S')}] Uyandırma alındı, kuyruğa bakılıyor")
+                except asyncio.TimeoutError:
+                    pass
                 consecutive_errors = 0
                 continue
 
@@ -294,6 +316,29 @@ async def worker_loop():
                 break
 
             await asyncio.sleep(10)
+
+@app.post("/wake")
+async def wake(request: Request):
+    """
+    Kuyrukta yeni is var, worker hemen baksin.
+
+    ikas_judgeme'deki /api/onboarding/setup, isi kuyruga ekledikten sonra
+    burayi cagiriyor. Islemi BASLATMAZ - sadece 30 saniyelik yoklamayi
+    kisa keser; asil secimi yine get_next_job yapar.
+
+    Idempotent ve ucuz: ard arda cagrilmasi zarar vermez.
+    """
+    if not WAKE_SECRET:
+        return {"ok": False, "reason": "WAKE_SECRET tanımlı değil"}
+
+    if request.headers.get("x-wake-secret") != WAKE_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if uyandirma_olayi is not None:
+        uyandirma_olayi.set()
+
+    return {"ok": True, "worker_running": worker_running}
+
 
 @app.get("/health")
 async def health():
