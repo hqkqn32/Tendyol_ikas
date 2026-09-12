@@ -16,11 +16,30 @@ nest_asyncio.apply()
 
 worker_running = False
 
+# Gecelik turda magazalar arasi bosluk. Hiz icin degil, Trendyol'a
+# kesintisiz yuklenmemek icin. 39 magaza -> ~3.2 saate yayilir.
+ARALIK_DAKIKA = 5
+
+# Ust uste gelen isler arasinda (orn. elle kuyruga atilanlar) kisa nefes.
+IS_ARASI_SANIYE = 10
+
 
 def schedule_all_stores():
     """
-    Tüm aktif mağazalar için ScrapeQueue'ya job ekle
-    Mağazalar arasında 10 dakika boşluk bırak
+    Tüm aktif mağazalar için ScrapeQueue'ya job ekle.
+
+    Magazalar arasinda ARALIK_DAKIKA bosluk birakiliyor.
+
+    Eskiden 10 dakikaydi ve 39 magaza 6.5 saate yayiliyordu; o aralik, is
+    basina dakikalarca suren eski koda goreydi. Artik bir tur 5-50 saniye,
+    yani worker her isin ardindan ~9.5 dakika bos bekliyordu.
+
+    5 dakikaya cekildi. Daha da kisaltmak teknik olarak mumkun ama bu aralik
+    hiz icin degil, Trendyol'a kesintisiz yuklenmemek icin duruyor.
+
+    ILK KURULUMLARI GECIKTIRMEZ: onlar priority='high' ile giriyor ve
+    get_next_job once oncelige gore siraliyor, yani gecelik yigini atlayip
+    one geciyorlar.
     """
     conn = get_connection()
     cur = conn.cursor()
@@ -46,7 +65,7 @@ def schedule_all_stores():
         print(f"[{time.strftime('%H:%M:%S')}] 📋 {len(stores)} aktif mağaza bulundu, joblar ekleniyor...")
 
         for i, store in enumerate(stores):
-            delay_minutes = i * 10
+            gecikme = i * ARALIK_DAKIKA
             cur.execute("""
                 INSERT INTO "ScrapeQueue" (
                     id,
@@ -68,9 +87,9 @@ def schedule_all_stores():
                     NOW(),
                     NOW()
                 )
-            """, (store["store_id"], store["config_id"], delay_minutes))
+            """, (store["store_id"], store["config_id"], gecikme))
 
-            print(f"[{time.strftime('%H:%M:%S')}]    + {store['seller_id']} → +{delay_minutes} dakika sonra")
+            print(f"[{time.strftime('%H:%M:%S')}]    + {store['seller_id']} → +{gecikme} dakika sonra")
 
         conn.commit()
         print(f"[{time.strftime('%H:%M:%S')}] ✅ {len(stores)} job eklendi")
@@ -80,6 +99,41 @@ def schedule_all_stores():
         conn.rollback()
         print(f"[{time.strftime('%H:%M:%S')}] ❌ Schedule hatası: {e}")
         return 0
+    finally:
+        cur.close()
+        conn.close()
+
+
+def kurtar_oksuz_isler():
+    """
+    Yeniden baslatma yuzunden 'running' kalmis isleri pending'e cevirir.
+
+    get_next_job YALNIZCA pending is aliyor ve hicbir yerde 'running'
+    satirlar toparlanmiyordu: konteyner bir isin ortasinda yeniden
+    baslarsa o satir sonsuza dek 'running' kalip bir daha islenmiyordu.
+    (12 Eylul 2026'daki deploy'da suledturkiye tam boyle takildi, elle
+    duzeltildi.)
+
+    Esik 10 dakika: calisan bir isi yanlislikla kapmayalim. Olculen en uzun
+    tur 85 saniye, yani genis bir pay var.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            UPDATE "ScrapeQueue"
+            SET status = 'pending', "startedAt" = NULL, "updatedAt" = NOW()
+            WHERE status = 'running'
+              AND "startedAt" < NOW() - INTERVAL '10 minutes'
+            RETURNING id
+        """)
+        n = len(cur.fetchall())
+        conn.commit()
+        if n:
+            print(f"[{time.strftime('%H:%M:%S')}] {n} oksuz is kurtarildi (running -> pending)")
+    except Exception as e:
+        conn.rollback()
+        print(f"[{time.strftime('%H:%M:%S')}] Oksuz is kurtarma hatasi: {e}")
     finally:
         cur.close()
         conn.close()
@@ -124,6 +178,9 @@ async def lifespan(app: FastAPI):
     worker_running = True
 
     notify_service_start()
+
+    # Worker baslamadan once: onceki calistirmadan kalmis isleri geri al.
+    kurtar_oksuz_isler()
 
     asyncio.create_task(worker_loop())
     asyncio.create_task(cron_loop())
@@ -220,7 +277,7 @@ async def worker_loop():
                     notify_service_crash(crash_msg)
                     break
 
-            await asyncio.sleep(5)
+            await asyncio.sleep(IS_ARASI_SANIYE)
 
         except Exception as e:
             error_msg = f"Worker loop kritik hatası: {str(e)}"
