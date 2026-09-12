@@ -238,6 +238,14 @@ def auto_publish_matched_reviews(config_id: str, newly_saved_review_ids: list) -
 #   medyalar -> yukaridaki review id'leriyle
 GRUP = 500
 
+# Sayfalar arasi bekleme. Trendyol'u zorlamamak icin var.
+# Olculdu (kiperinturkiye, 187 sayfa, 3.724 yorum - ucunde de ayni veri,
+# sifir hata):
+#   0.30 -> 78.1s     0.20 -> 59.0s     0.15 -> 46.0s
+# Istek suresi uc turda da ~20s kaldi, yani hiz sinirina yaklastigimiza
+# dair bir isaret yok. 0.15 de temiz gecti; 0.20'de duruldu.
+SAYFA_ARASI_SANIYE = 0.2
+
 
 def _grup_yaz(conn, sql, satirlar, template, fetch=False):
     """Tek execute_values. Cagiran taraf hatayi yakalar."""
@@ -508,7 +516,7 @@ async def _run_async(config_id: str, seller_id: str, scrape_type: str = "update"
                 break
             
             page += 1
-            time.sleep(0.3)
+            time.sleep(SAYFA_ARASI_SANIYE)
         
         print(f"\n✅ Toplam {len(all_reviews)} yorum çekildi\n")
         

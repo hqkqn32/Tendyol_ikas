@@ -323,7 +323,12 @@ async def health():
             WHERE status = 'pending'
               AND "scheduledAt" <= NOW()
         """)
-        pending_ready = cur.fetchone()["pending_count"]
+        # Takma ad "count"; eskiden "pending_count" okunuyordu ve her
+        # cagride KeyError atiyordu. Hata except'e dusup 200 ile
+        # {"status":"error"} donduruyordu; docker healthcheck ise
+        # "curl -f" oldugu icin 200'u basarili sayiyordu. Sonuc: konteyner
+        # haftalardir hicbir sey kontrol etmeden "healthy" goruntusundeydi.
+        pending_ready = cur.fetchone()["count"]
         
         cur.close()
         conn.close()
